@@ -1,4 +1,4 @@
-//! viewer 侧 Socket.IO / Engine.IO 客户端：`control`（带二进制 ConnectOptions）→ ack，
+//! 控制端 Socket.IO / Engine.IO 客户端：`control`（带二进制 ConnectOptions）→ ack，
 //! `soac` 收发 candidate/offer/answer。
 //!
 //! 官方 host 可能用二进制事件（`451-` + 附件）回 answer，附件按 base64 替换进 JSON，
@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
@@ -27,7 +27,13 @@ pub struct Signal {
 }
 
 impl Signal {
-    pub async fn connect(server: &str, room_token: &str, timeout: Duration, events: mpsc::Sender<Value>) -> Result<Arc<Self>, String> {
+    pub async fn connect(
+        server: &str,
+        room_token: &str,
+        timeout: Duration,
+        events: mpsc::Sender<Value>,
+        closed: watch::Sender<bool>,
+    ) -> Result<Arc<Self>, String> {
         let url = format!("{}/socket.io/?transport=websocket&EIO=4", server.trim_end_matches('/'));
         let mut request = url.into_client_request().map_err(|_| "信令 URL 无效")?;
         request
@@ -41,12 +47,15 @@ impl Signal {
         let (out, mut out_rx) = mpsc::channel::<Message>(64);
         let ack: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
 
+        let write_closed = closed.clone();
         tokio::spawn(async move {
             while let Some(message) = out_rx.recv().await {
                 if write.send(message).await.is_err() {
                     break;
                 }
             }
+            // 写端退出就等于这条路已经不可用（对端关闭 / 网络断）。
+            let _ = write_closed.send(true);
         });
 
         let writer = out.clone();
@@ -55,6 +64,7 @@ impl Signal {
         let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let ready = Arc::new(Mutex::new(Some(ready_tx)));
         let ready_reader = ready.clone();
+        let read_closed = closed.clone();
         tokio::spawn(async move {
             let mut window = Duration::from_secs(45);
             let mut deadline = tokio::time::Instant::now() + window;
@@ -69,6 +79,9 @@ impl Signal {
                 };
                 let Some(Ok(message)) = message else { break };
                 let Message::Text(text) = message else { continue };
+                if log::log_enabled!(log::Level::Trace) {
+                    log::trace!("<- {} ({}B)", frame_summary(&text), text.len());
+                }
 
                 if text.starts_with('0') {
                     if let Ok(open) = serde_json::from_str::<Value>(&text[1..]) {
@@ -92,12 +105,17 @@ impl Signal {
                     let Some(begin) = rest.find('[') else { continue };
                     let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&rest[begin..]) else { continue };
                     let id = rest[..begin].parse::<u64>().unwrap_or(0);
-                    if items.first().and_then(Value::as_str) == Some("success") {
-                        if let Some(tx) = acks.lock().unwrap().remove(&id) {
-                            let _ = tx.send(items.get(1).cloned().unwrap_or(Value::Null));
+                    // `control` 的 ack 是 `["success", body]`；`room_info` 的 ack 直接给对象。
+                    let body = match items.first().and_then(Value::as_str) {
+                        Some("success") => items.get(1).cloned().unwrap_or(Value::Null),
+                        Some("error") => {
+                            log::warn!("信令返回 error（内容不打印）");
+                            continue;
                         }
-                    } else if items.first().and_then(Value::as_str) == Some("error") {
-                        log::warn!("信令返回 error（内容不打印）");
+                        _ => items.first().cloned().unwrap_or(Value::Null),
+                    };
+                    if let Some(tx) = acks.lock().unwrap().remove(&id) {
+                        let _ = tx.send(body);
                     }
                 } else if text.starts_with("45") || text.starts_with("46") {
                     let binary_ack = text.starts_with("46");
@@ -139,6 +157,8 @@ impl Signal {
                     }
                 }
             }
+            // 读任务退出：心跳超时、连接关闭或事件无人接收，都说明会话已经不可用。
+            let _ = read_closed.send(true);
         });
 
         // 命名空间没连上就发 control，云端不会回 ack（表现为“等待 control ack 超时”）。
@@ -167,13 +187,34 @@ impl Signal {
             .send(Message::Text(format!("451-{id}{}", json!(["control", header]))))
             .await
             .map_err(|_| "信令已断开")?;
+        // 附件必须以 0x04 开头（老版 Engine.IO 的分帧前缀，官方 viewer 就是这么发的）。
+        // 少了这个字节，官方 host 解析出的 ConnectOptions 是废的，`be-controlled` 不落地，
+        // 后续 offer 直接被丢弃——表现为 control ack 之后再也没有任何下行信令。
+        let mut options = vec![4u8];
+        options.extend_from_slice(&connect_options(capture_type, device));
         self.out
-            .send(Message::Binary(connect_options(capture_type, device)))
+            .send(Message::Binary(options))
             .await
             .map_err(|_| "信令已断开")?;
         tokio::time::timeout(Duration::from_secs(15), rx)
             .await
             .map_err(|_| "等待 control ack 超时")?
+            .map_err(|_| "信令已断开".to_string())
+    }
+
+    /// 房间成员自报家门。云端回 `{publisher, subscribers, you, iceServers}`，
+    /// `you.client_id` 是本端路由 id。
+    pub async fn room_info(&self) -> Result<Value, String> {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.ack.lock().unwrap().insert(id, tx);
+        self.out
+            .send(Message::Text(format!("42{id}[\"room_info\"]")))
+            .await
+            .map_err(|_| "信令已断开")?;
+        tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .map_err(|_| "等待 room_info ack 超时")?
             .map_err(|_| "信令已断开".to_string())
     }
 
@@ -217,6 +258,18 @@ fn bytes(field: u32, value: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(value);
 }
 
+/// 入站帧摘要：engine.io / socket.io 前缀 + 事件名。不含业务内容（SDP、凭据不进日志）。
+fn frame_summary(text: &str) -> String {
+    let mut out: String = text.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').take(8).collect();
+    if let Some(begin) = text.find('[') {
+        if let Some(name) = text[begin..].strip_prefix("[\"").and_then(|rest| rest.split('"').next()) {
+            out.push(' ');
+            out.extend(name.chars().take(24));
+        }
+    }
+    out
+}
+
 /// Socket.IO 二进制附件：把 `{"_placeholder":true,"num":n}` 换成附件 n 的 base64。
 fn substitute(value: &mut Value, attachments: &[Vec<u8>]) {
     use base64::Engine;
@@ -256,6 +309,14 @@ mod tests {
         let terminal_options = connect_options(CAPTURE_TERMINAL, "dev");
         let terminal = read_fields(&terminal_options).unwrap();
         assert_eq!(terminal.iter().map(|f| f.number).collect::<Vec<_>>(), vec![1, 2, 8, 9, 10, 12]);
+    }
+
+    #[test]
+    fn frame_summary_keeps_the_event_name_and_drops_the_payload() {
+        assert_eq!(frame_summary("42[\"soac\",{\"sdp\":\"v=0\"}]"), "42 soac");
+        assert_eq!(frame_summary("451-1[\"control\",{}]"), "451-1 control");
+        assert_eq!(frame_summary("0{\"sid\":\"x\"}"), "0");
+        assert_eq!(frame_summary("2"), "2");
     }
 
     #[test]

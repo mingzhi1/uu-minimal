@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -118,8 +118,9 @@ struct Term {
     master: OwnedFd,
     /// 进程组（setsid 之后 pgrp == pid），信号打到整组。
     group: i32,
-    /// 当前 viewer 的下行队列；None 表示已 detach。
-    link: Mutex<Option<UnboundedSender<Vec<u8>>>>,
+    /// 当前 viewer 的下行队列，带所属 peer 的 token；None 表示已 detach。
+    /// token 让 peer 被拆除时能精确解绑，不会把队列和任务留在内存里。
+    link: Mutex<Option<(u64, UnboundedSender<Vec<u8>>)>>,
     journal: Mutex<VecDeque<u8>>,
     window: Mutex<(u16, u16)>,
 }
@@ -135,7 +136,7 @@ impl Term {
             let excess = journal.len().saturating_sub(JOURNAL_LIMIT);
             journal.drain(..excess);
         }
-        if let Some(tx) = link.as_ref() {
+        if let Some((_, tx)) = link.as_ref() {
             if tx.send(frame(Type::Stdout, self.id, chunk)).is_err() {
                 *link = None;
             }
@@ -144,7 +145,7 @@ impl Term {
 
     fn push(&self, kind: Type, payload: &[u8]) -> bool {
         let mut link = self.link.lock().unwrap();
-        if let Some(tx) = link.as_ref() {
+        if let Some((_, tx)) = link.as_ref() {
             if tx.send(frame(kind, self.id, payload)).is_ok() {
                 return true;
             }
@@ -207,6 +208,8 @@ fn hub() -> &'static Mutex<HashMap<u32, Arc<Term>>> {
 }
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+/// 每条 viewer 终端端点一个 token，用来在连接被拆除时精确解绑会话。
+static NEXT_PEER: AtomicU64 = AtomicU64::new(1);
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
@@ -364,11 +367,13 @@ fn reply(code: i64, message: &str) -> Vec<u8> {
 /// 一条 viewer 连接的终端端点；`out` 发到 BINARY_DATA_CHANNEL。
 pub struct TerminalConn {
     out: UnboundedSender<Vec<u8>>,
+    /// 这条端点属于哪个 peer；会话的 `link` 里记的就是它。
+    peer: u64,
 }
 
 impl TerminalConn {
     pub fn new(out: UnboundedSender<Vec<u8>>) -> Self {
-        Self { out }
+        Self { out, peer: NEXT_PEER.fetch_add(1, Ordering::Relaxed) }
     }
 
     fn send(&self, kind: Type, session: u32, payload: &[u8]) {
@@ -443,7 +448,7 @@ impl TerminalConn {
         // 先回 OPEN_RESP 再挂上行，读线程不会抢在应答前面发实时输出。
         let mut link = term.link.lock().unwrap();
         self.send(Type::OpenResp, term.id, &reply(0, "ok"));
-        *link = Some(self.out.clone());
+        *link = Some((self.peer, self.out.clone()));
         let journal: Vec<u8> = term.journal.lock().unwrap().iter().copied().collect();
         for chunk in journal.chunks(CHUNK) {
             self.send(Type::Stdout, term.id, chunk);
@@ -492,6 +497,22 @@ impl TerminalConn {
         log::info!("Terminal list sessions: count={}", sessions.len());
         // 官方 Mac 4.42.0 的 handleListSessionsReq 回的是裸数组，session 字段用请求里的 ID。
         self.send(Type::ListResp, session, serde_json::Value::Array(sessions).to_string().as_bytes());
+    }
+}
+
+impl Drop for TerminalConn {
+    /// peer 被拆除时解绑它的会话：否则 `Term.link` 会一直攥着这条连接的下行 sender，
+    /// 让下游任务永不退出（每次重连泄漏两个任务 + 一条无界队列），
+    /// 并且在断线期间对每一帧输出打一条发送失败日志。
+    fn drop(&mut self) {
+        let peer = self.peer;
+        for term in hub().lock().unwrap().values() {
+            let mut link = term.link.lock().unwrap();
+            let mine = link.as_ref().map(|(owner, _)| *owner == peer).unwrap_or(false);
+            if mine {
+                *link = None;
+            }
+        }
     }
 }
 
@@ -649,6 +670,25 @@ mod tests {
             assert_eq!(drain(&mut rx).payload, b"live output");
             conn.handle(&frame(Type::Detach, id, &[]));
         }
+    }
+
+    #[test]
+    fn dropping_the_endpoint_detaches_its_sessions() {
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let id = u32::MAX - 3;
+        let term = Arc::new(Term { id, shell: "/bin/sh".into(), started_ms: now_ms(), group: 0, master: pty.master,
+            link: Mutex::new(None), journal: Mutex::new(VecDeque::new()), window: Mutex::new((80, 24)) });
+        hub().lock().unwrap().insert(id, term.clone());
+        struct Guard(u32);
+        impl Drop for Guard { fn drop(&mut self) { hub().lock().unwrap().remove(&self.0); } }
+        let _guard = Guard(id);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let conn = TerminalConn::new(tx);
+        conn.handle(&frame(Type::Open, id, br#"{"cols":80,"rows":24}"#));
+        assert!(term.link.lock().unwrap().is_some(), "attach 后会话必须挂到这条连接");
+        drop(conn);
+        assert!(term.link.lock().unwrap().is_none(), "连接拆除后必须解绑，否则下游任务永不退出");
     }
 
     #[test]

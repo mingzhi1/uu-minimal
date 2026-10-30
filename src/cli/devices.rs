@@ -56,7 +56,7 @@ impl Device {
             "{}  {}  {}  {}",
             ui::pad(&self.name, 22),
             self.id,
-            ui::pad(platform_label(self.platform), 8),
+            ui::pad(&platform_label(self.platform), 8),
             if self.shared { "共享" } else { "自有" }
         )
     }
@@ -77,23 +77,42 @@ struct LocalDevice {
     controllable: Option<bool>,
 }
 
-/// 云端 platform 取值 → 名字（1 = Windows，4 = macOS）。
+/// 云端 platform 取值 → 名字（1 = Windows，4 = macOS）；未知值保留原始编号，方便排查。
 
-fn platform_label(platform: i64) -> &'static str {
+fn platform_label(platform: i64) -> String {
     match platform {
-        1 => "windows",
-        4 => "macos",
-        _ => "unknown",
+        1 => "windows".to_owned(),
+        2 => "android".to_owned(),
+        4 => "macos".to_owned(),
+        other => format!("p{other}"),
     }
 }
 
-pub async fn list_command() -> Result<(), String> {
+pub async fn list_command(args: &[String]) -> Result<(), String> {
+    let args = Args::new(args);
     let api = loaded_api()?;
-    let data = api.devices().await?;
+    // `/device/groups/of/my` 才带 mobile_devices / tv_devices；`/device/list` 只有桌面。
+    // 分组接口失败（老账号/接口变动）再退回设备列表。
+    let data = match api.device_groups().await {
+        Ok(groups) => groups,
+        Err(_) => api.devices().await?,
+    };
+    // `--json`：原样打印云端 data，用来看清到底返回了哪些分组与字段。
+    if args.flag("--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).map_err(|e| format!("序列化失败: {e}"))?
+        );
+        return Ok(());
+    }
     let devices = collect_devices(&data);
     ui::banner("设备");
     print_local(&data);
     print_devices(&devices);
+    if devices.is_empty() {
+        ui::hint("\n  没有设备：手机需登录同一账号，并在手机 App 里开启被控（允许远程控制）。");
+        ui::hint("  用 `uu-minimal list --json` 看云端原始返回。");
+    }
     // 非交互（管道/脚本）时只打印，不进菜单。
     if devices.is_empty() || !ui::is_tty() {
         return Ok(());
@@ -114,8 +133,16 @@ fn state_text(online: Option<bool>, status: &str) -> String {
 }
 
 fn collect_devices(data: &Value) -> Vec<Device> {
+    let current = data.get("current_device_id").and_then(Value::as_str).unwrap_or_default().to_owned();
     let mut devices = Vec::new();
-    for (shared, key) in [(false, "my_binded_devices"), (true, "others_shared_devices")] {
+    // 分组接口：desktop / mobile / tv；设备列表接口：自有 / 共享。
+    for (shared, key) in [
+        (false, "desktop_devices"),
+        (false, "mobile_devices"),
+        (false, "tv_devices"),
+        (false, "my_binded_devices"),
+        (true, "others_shared_devices"),
+    ] {
         for device in data.get(key).and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default() {
             devices.push(Device {
                 id: text_field(device, &["device_id", "id"]),
@@ -127,12 +154,36 @@ fn collect_devices(data: &Value) -> Vec<Device> {
             });
         }
     }
+    // 本机在分组接口里混在 desktop_devices 里，单独一段展示，不进选择列表。
+    if !current.is_empty() {
+        devices.retain(|device| device.id != current);
+    }
     devices
 }
 
 /// `current_device` 缺失或没有 device_id 时返回 `None`（此时只列云端设备列表）。
 
 fn local_device(data: &Value) -> Option<LocalDevice> {
+    // 分组接口只给 current_device_id，本机详情混在 desktop_devices 里。
+    if let Some(current) = data.get("current_device_id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+        let entry = data
+            .get("desktop_devices")
+            .and_then(Value::as_array)
+            .and_then(|list| list.iter().find(|device| device.get("device_id").and_then(Value::as_str) == Some(current)));
+        return Some(LocalDevice {
+            id: current.to_owned(),
+            name: entry.map(|value| text_field(value, &["alias", "device_name", "name"])).unwrap_or_else(|| "-".into()),
+            platform: entry.and_then(|value| value.get("platform")).and_then(Value::as_i64).unwrap_or(0),
+            status: entry
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            controllable: entry
+                .and_then(|value| value.get("controllable"))
+                .and_then(Value::as_bool),
+        });
+    }
     let local = data.get("current_device").filter(|value| value.is_object())?;
     let id = local.get("device_id").and_then(Value::as_str).filter(|id| !id.is_empty())?;
     Some(LocalDevice {
@@ -160,7 +211,7 @@ fn print_local(data: &Value) {
         "  {} {}  {}  {}{control}",
         ui::pad(&local.name, 22),
         local.id,
-        ui::pad(platform_label(local.platform), 8),
+        ui::pad(&platform_label(local.platform), 8),
         state_text(None, &local.status)
     );
 }
@@ -175,7 +226,7 @@ fn print_devices(devices: &[Device]) {
                 ui::dim(&format!("{})", index + 1)),
                 ui::pad(&device.name, 22),
                 device.id,
-                ui::pad(platform_label(device.platform), 8),
+                ui::pad(&platform_label(device.platform), 8),
                 device.state_label()
             );
             any = true;
@@ -186,6 +237,34 @@ fn print_devices(devices: &[Device]) {
     }
 }
 
+/// 调试用：直接打一个签名请求，看云端原始返回（排查设备/能力字段时用）。
+/// 用法：`uu-minimal api GET /api/v1/device/list`、`uu-minimal api POST /api/v1/xxx '{"a":1}'`
+pub async fn api_command(args: &[String]) -> Result<(), String> {
+    let args = Args::new(args);
+    let positional = args.positionals();
+    let method = positional.first().map(|m| m.to_ascii_uppercase()).unwrap_or_default();
+    let path = positional.get(1).ok_or("用法: uu-minimal api <GET|POST> <路径> [json]")?;
+    let api = loaded_api()?;
+    let (status, body) = match method.as_str() {
+        "GET" => api.get(path).await?,
+        "POST" => {
+            let value: Value = match positional.get(2) {
+                Some(raw) => serde_json::from_str(raw).map_err(|e| format!("body 不是合法 JSON: {e}"))?,
+                None => Value::Null,
+            };
+            let body = value.is_null().then_some(None).unwrap_or(Some(&value));
+            api.post(path, body).await?
+        }
+        other => return Err(format!("只支持 GET / POST，收到 {other}")),
+    };
+    println!("http {status}");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
+    );
+    Ok(())
+}
+
 /// 设备二级菜单：ssh / sftp / portmap。
 
 async fn menu_device(device: &Device) -> Result<(), String> {
@@ -194,7 +273,7 @@ async fn menu_device(device: &Device) -> Result<(), String> {
         println!(
             "{}  {}  {}",
             device.id,
-            ui::pad(platform_label(device.platform), 8),
+            ui::pad(&platform_label(device.platform), 8),
             device.state_label()
         );
         let actions = ["ssh", "sftp", "portmap", "返回"];

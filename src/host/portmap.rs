@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
-use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::DataChannel;
 
 pub const MESSAGE_FIELD: u32 = 27;
 
@@ -23,11 +23,13 @@ const VERSION: u64 = 1;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_CHUNK: usize = 16 * 1024;
 /// 一条流写往目标前允许排队的帧数，超了就按官方行为关流（"写缓冲超限"）。
-const QUEUE_FRAMES: usize = 256;
+const QUEUE_FRAMES: usize = 1024;
 /// data channel 上积压到这么多就暂停读目标（官方 host 的背压阈值）。
 const BUFFER_HIGH_WATER: usize = 4 * 1024 * 1024;
-/// 等 FILE_DATA_CHANNEL 打开的上限：100 × 50 ms。
-const CHANNEL_WAIT: (u32, Duration) = (100, Duration::from_millis(50));
+/// 等 FILE_DATA_CHANNEL 打开的上限：20 × 50 ms。
+/// SYN 本身就是从这条通道进来的，正常情况下这里只会命中缓存；
+/// 留 1s 只是兜底，绝不能每条帧都卡 5 秒（那会把整条出向队列拖死）。
+const CHANNEL_WAIT: (u32, Duration) = (20, Duration::from_millis(50));
 
 pub fn enabled() -> bool {
     std::env::var("UU_PORT_MAPPING").map_or(true, |value| value != "0")
@@ -173,12 +175,16 @@ struct Pipe {
 pub struct Session {
     /// 所有出向帧都排这一条队列，保证同一流的 SYN_ACK 先于 DATA。
     outbound: mpsc::Sender<(Key, Kind, Vec<u8>)>,
-    pipes: Mutex<HashMap<Key, Pipe>>,
+    pipes: Arc<Mutex<HashMap<Key, Pipe>>>,
+    /// 无序快通道（`UU_FAST=1` 时 viewer 才会建）。未就绪时 DATA 自动回退 FILE 通道。
+    fast: Arc<crate::net::fast::FastLink>,
+    /// 快通道用 u32 流号，这里映射回端口映射的 (session, rule, stream) 三元组。
+    fast_routes: Arc<Mutex<HashMap<u32, Key>>>,
 }
 
 impl Session {
     /// `channel` 是 peer 的 FILE_DATA_CHANNEL 槽位，viewer 打开前是 `None`。
-    pub fn new(channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>, sequence: Arc<AtomicU64>) -> Arc<Self> {
+    pub fn new(channel: Arc<Mutex<Option<Arc<dyn DataChannel>>>>, sequence: Arc<AtomicU64>) -> Arc<Self> {
         let (outbound, mut queue) = mpsc::channel::<(Key, Kind, Vec<u8>)>(64);
         tokio::spawn(async move {
             while let Some((key, kind, payload)) = queue.recv().await {
@@ -186,7 +192,8 @@ impl Session {
                     log::warn!("Port mapping frame dropped: no FILE_DATA_CHANNEL");
                     continue;
                 };
-                while channel.buffered_amount().await > BUFFER_HIGH_WATER {
+                // 0.21 去掉了 buffered_amount()，等价物是 outstanding_bytes()（已排队未发完的字节）。
+                while channel.outstanding_bytes().await.unwrap_or(0) > BUFFER_HIGH_WATER {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -196,17 +203,69 @@ impl Session {
                     MESSAGE_FIELD,
                     &encode(&key, kind, &payload),
                 );
-                if let Err(error) = channel.send(&bytes::Bytes::from(message)).await {
+                if let Err(error) = channel.send(bytes::BytesMut::from(&message[..])).await {
                     log::warn!("Port mapping send failed: {}", error);
                     break;
                 }
             }
         });
-        Arc::new(Self { outbound, pipes: Mutex::new(HashMap::new()) })
+        let pipes: Arc<Mutex<HashMap<Key, Pipe>>> = Arc::new(Mutex::new(HashMap::new()));
+        let routes: Arc<Mutex<HashMap<u32, Key>>> = Arc::new(Mutex::new(HashMap::new()));
+        let (fast_inbox, mut fast_rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+        let fast = crate::net::fast::FastLink::new(fast_inbox);
+        {
+            let (pipes, routes) = (pipes.clone(), routes.clone());
+            tokio::spawn(async move {
+                while let Some((stream, payload)) = fast_rx.recv().await {
+                    let key = routes.lock().unwrap().get(&stream).cloned();
+                    let Some(key) = key else { continue };
+                    let writes = pipes.lock().unwrap().get(&key).map(|pipe| pipe.writes.clone());
+                    if payload.is_empty() {
+                        // 空载荷 = 对端 FIN：收掉目标连接（不再回 FIN，对端已经关了）。
+                        pipes.lock().unwrap().remove(&key);
+                        routes.lock().unwrap().remove(&stream);
+                        continue;
+                    }
+                    if let Some(writes) = writes {
+                        // 目标写不动就丢这一帧：底层 TCP 会自己重传，不能把快通道读挂住。
+                        let _ = writes.send(payload).await;
+                    }
+                }
+            });
+        }
+        Arc::new(Self { outbound, pipes, fast, fast_routes: routes })
+    }
+
+    /// viewer 建好快通道后挂上来。
+    pub fn attach_fast(&self, channel: Arc<dyn DataChannel>) {
+        self.fast.attach(channel);
+    }
+
+    /// 处理一条入向快通道报文（已排序的载荷会写进对应目标连接）。
+    pub async fn feed_fast(&self, data: &[u8]) {
+        self.fast.feed(data).await;
+    }
+
+    /// 快通道流号：端口映射的 rule_id 在 viewer 侧是递增 u64，正常情况必然落在 u32 内。
+    fn fast_stream(key: &Key) -> Option<u32> {
+        match key.rule {
+            Ident::Int(value) if value <= u64::from(u32::MAX) => Some(value as u32),
+            _ => None,
+        }
+    }
+
+    /// 出向数据：快通道就绪就走它，否则回退到 FILE 通道（官方 host 只认 FILE）。
+    async fn send_data(&self, key: &Key, payload: Vec<u8>) {
+        if let Some(stream) = Self::fast_stream(key) {
+            if self.fast.send(stream, &payload).await {
+                return;
+            }
+        }
+        let _ = self.outbound.send((key.clone(), Kind::Data, payload)).await;
     }
 
     /// 处理 Message 27；返回 true 表示这条消息属于端口映射（无论是否接受）。
-    pub fn handle(self: &Arc<Self>, message: &[crate::proto::Field], channel: &str) -> bool {
+    pub async fn handle(self: &Arc<Self>, message: &[crate::proto::Field<'_>], channel: &str) -> bool {
         let Some(raw) = message.iter().find(|field| field.number == MESSAGE_FIELD).and_then(|field| field.blob())
         else {
             return false;
@@ -240,7 +299,7 @@ impl Session {
             .unwrap_or(&[]);
         match kind {
             Some(Kind::Syn) => self.accept_syn(key, payload),
-            Some(Kind::Data) => self.forward(key, payload),
+            Some(Kind::Data) => self.forward(key, payload).await,
             Some(Kind::Fin) => self.close(&key, false),
             Some(Kind::DataAck) | Some(Kind::SynAck) => {}
             None => log::info!("Port mapping unsupported frame type"), // 未知类型：忽略
@@ -249,22 +308,30 @@ impl Session {
     }
 
     /// 把 viewer 的 DATA 写进目标；没有这条流就回 FIN 让 viewer 收尾。
-    fn forward(self: &Arc<Self>, key: Key, payload: &[u8]) {
+    ///
+    /// 这里必须**阻塞**发送：队列满时丢一帧就是把 TCP 字节流啃出一个洞，
+    /// 上层（scrcpy / ssh / http）看到的是花屏或协议错误，而不是一次可重试的失败。
+    /// 背压由 SCTP 窗口最终传导回 viewer 的 socket 读端。
+    async fn forward(self: &Arc<Self>, key: Key, payload: &[u8]) {
         let writes = self.pipes.lock().unwrap().get(&key).map(|pipe| pipe.writes.clone());
         match writes {
             Some(writes) => {
-                if writes.try_send(payload.to_vec()).is_err() {
-                    log::warn!("Port mapping write buffer full; closing stream");
+                if writes.send(payload.to_vec()).await.is_err() {
+                    log::info!("Port mapping target closed; closing stream");
                     self.close(&key, true);
                 }
             }
             None => {
-                let _ = self.outbound.try_send((key, Kind::Fin, Vec::new()));
+                let _ = self.outbound.send((key, Kind::Fin, Vec::new())).await;
             }
         }
     }
 
     fn accept_syn(self: &Arc<Self>, key: Key, payload: &[u8]) {
+        // 先登记快通道路由：viewer 收到 SYN_ACK 后可能立刻改走快通道发数据。
+        if let Some(stream) = Self::fast_stream(&key) {
+            self.fast_routes.lock().unwrap().insert(stream, key.clone());
+        }
         let target = if enabled() { target_of(payload) } else { Err("port mapping disabled on this host".into()) };
         let (host, port) = match target {
             Ok(target) => target,
@@ -313,9 +380,7 @@ impl Session {
                     match source.read(&mut buffer).await {
                         Ok(0) | Err(_) => break,
                         Ok(read) => {
-                            if owner.outbound.send((key_for_reader.clone(), Kind::Data, buffer[..read].to_vec())).await.is_err() {
-                                return;
-                            }
+                            owner.send_data(&key_for_reader, buffer[..read].to_vec()).await;
                         }
                     }
                 }
@@ -334,10 +399,26 @@ impl Session {
     /// 丢掉一条流：写任务会因为队列关闭而 shutdown 目标，读任务直接 abort；
     /// `tell_peer` 时补一条 FIN。
     fn close(&self, key: &Key, tell_peer: bool) {
+        if let Some(stream) = Self::fast_stream(key) {
+            self.fast_routes.lock().unwrap().remove(&stream);
+        }
         let Some(pipe) = self.pipes.lock().unwrap().remove(key) else { return };
         pipe.reader.abort();
         if tell_peer {
-            let _ = self.outbound.try_send((key.clone(), Kind::Fin, Vec::new()));
+            let packet = (key.clone(), Kind::Fin, Vec::new());
+            match self.outbound.try_send(packet) {
+                Ok(()) => {}
+                // The ordered queue can be full when many streams close at once.
+                // Dropping FIN would leave the viewer waiting for a timeout; hand
+                // it to a task that applies normal backpressure instead.
+                Err(mpsc::error::TrySendError::Full(packet)) => {
+                    let outbound = self.outbound.clone();
+                    tokio::spawn(async move {
+                        let _ = outbound.send(packet).await;
+                    });
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
         }
     }
 
@@ -354,7 +435,7 @@ impl Session {
 }
 
 /// 等 FILE_DATA_CHANNEL 打开，最多 `CHANNEL_WAIT`；拿不到返回 None（这一帧丢弃）。
-async fn open_channel(slot: &Arc<Mutex<Option<Arc<RTCDataChannel>>>>) -> Option<Arc<RTCDataChannel>> {
+async fn open_channel(slot: &Arc<Mutex<Option<Arc<dyn DataChannel>>>>) -> Option<Arc<dyn DataChannel>> {
     for attempt in 0..=CHANNEL_WAIT.0 {
         if let Some(channel) = slot.lock().unwrap().clone() {
             return Some(channel);
@@ -419,9 +500,9 @@ mod tests {
         let session = Session::new(Arc::new(Mutex::new(None)), Arc::new(AtomicU64::new(0)));
         let frame = encode(&Key { session: Ident::Int(1), rule: Ident::Int(1), stream: Ident::Int(1) }, Kind::Syn, b"{}");
         let message = vec![Field { number: MESSAGE_FIELD, value: Value::Bytes(&frame) }];
-        assert!(session.handle(&message, "BINARY_DATA_CHANNEL"));
+        assert!(session.handle(&message, "BINARY_DATA_CHANNEL").await);
         // 不是 Message 27 的消息不归端口映射管。
         let other = vec![Field { number: 22, value: Value::Bytes(b"") }];
-        assert!(!session.handle(&other, "FILE_DATA_CHANNEL"));
+        assert!(!session.handle(&other, "FILE_DATA_CHANNEL").await);
     }
 }

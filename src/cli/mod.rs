@@ -20,7 +20,9 @@ uu-minimal — UU 远程的最小可用骨架（登录 · 组网 · 终端 · �
   auth --login                   登录失效时重新扫码
 
 设备与工具（控制别人的设备）:
-  list                           列出本机身份与云端设备；stdin 是终端时直接进操作菜单
+  list [--json]                  列出本机身份与云端设备；--json 打印云端原始返回；
+                                 stdin 是终端时直接进操作菜单
+  api GET|POST <路径> [json]     调试：打一个签名请求，打印云端原始返回
   ssh    --device <id> [--user 用户] [--port 22] [--key 私钥] [--command 命令] [主机]
                                  内嵌 SSH（russh），不读 ~/.ssh/config；密码交互输入
                                  （--password 仍可用，但会出现在进程列表里）
@@ -62,7 +64,8 @@ pub async fn dispatch(command: &str, rest: &[String]) -> Result<(), String> {
         "run" => host::run().await,
         "login" => login::run().await,
         "auth" => devices::auth_command(rest).await,
-        "list" => devices::list_command().await,
+        "list" => devices::list_command(rest).await,
+        "api" => devices::api_command(rest).await,
         "portmap" => access::portmap_command(rest).await,
         "tunnel" => access::tunnel_command(rest).await,
         "ssh" => access::ssh_command(rest).await,

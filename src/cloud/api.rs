@@ -196,6 +196,20 @@ impl Api {
         Ok(body.get("data").cloned().unwrap_or(Value::Null))
     }
 
+    /// GET /api/v1/device/groups/of/my → data {current_device_id, desktop_devices[], mobile_devices[], tv_devices[]}
+    /// 手机/电视只在这里出现，`/device/list` 只有桌面。
+    pub async fn device_groups(&self) -> Result<Value, String> {
+        let (status, body) = self.get("/api/v1/device/groups/of/my").await?;
+        let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        if code == TOKEN_INVALID {
+            return Err("登录已失效，执行 `uu-minimal auth --login` 重新扫码".into());
+        }
+        if status != 200 || code != 0 {
+            return Err(format!("设备分组失败: http {status} code {code}"));
+        }
+        Ok(body.get("data").cloned().unwrap_or(Value::Null))
+    }
+
     /// POST /api/v1/room/join/by_device/{device}：以 viewer 身份加入。
     /// `force_join` 抢占已有会话——CLI 隧道被一条陈旧会话挡住比被踢更糟。
     pub async fn join_room(&self, device: &str) -> Result<RoomData, RoomError> {

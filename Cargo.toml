@@ -10,6 +10,12 @@ license = "MIT"
 name = "uu-minimal"
 path = "src/main.rs"
 
+[features]
+default = ["terminal"]
+# 终端会话（openpty + fork shell）。Android / 无 PTY 环境用 `--no-default-features` 编，
+# 只保留信令 + 端口映射，不引入 nix 依赖。
+terminal = ["dep:nix"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
@@ -24,18 +30,24 @@ base64 = "0.22"
 qrcode = { version = "0.14", default-features = false }
 log = "0.4"
 env_logger = "0.11"
-webrtc = "0.10"
+webrtc = "0.21"
+# sans-IO 核心：需要 RTCDtlsRole / MulticastDnsMode 这两个枚举（webrtc 这层没重导出）
+rtc = "0.21"
+# PeerConnectionEventHandler 是 async trait
+async-trait = "0.1"
 # 内嵌 SSH 客户端：把一条端口映射流当成 socket，不再依赖系统 ssh / ~/.ssh/config
 russh = "0.65.0"
 bytes = "1"
 # 官方 host 可能用 gzip_sdp 回 answer
 flate2 = "1"
 libc = "0.2"
-# 终端会话：openpty + Winsize（与主程序同样的特性集）
-nix = { version = "0.29", features = ["term", "process", "fs", "ioctl", "signal"] }
+# 终端会话：openpty + Winsize（与主程序同样的特性集）；只被 `terminal` feature 用到
+nix = { version = "0.29", features = ["term", "process", "fs", "ioctl", "signal"], optional = true }
 
-# 与主程序一致：使用仓库内打过补丁的 webrtc（data channel 收包缓冲、SRTP ROC、DTLS）。
-[patch.crates-io]
-webrtc = { path = "../vendor/webrtc" }
-webrtc-dtls = { path = "../vendor/webrtc-dtls" }
-webrtc-srtp = { path = "../vendor/webrtc-srtp" }
+# 传输层一律用 crates.io 上的上游 webrtc，不做任何 [patch.crates-io]，也不要指回本地目录。
+#
+# 版本 0.21.x（上游 sans-IO 重写后的形态）：`rtc` 是纯 sans-IO 核心，`webrtc` 是它上面的
+# async 胶水（内部自动跑 driver，调用方照样 await）。事件从「注册闭包」改成实现
+# `PeerConnectionEventHandler`，通道消息改成 `channel.poll()` 拿 `DataChannelEvent`。
+# 0.21 还必须用 `with_udp_addrs` 显式给本地 socket，且 `with_interface_filter` 被上游注释掉了，
+# 网卡过滤改由 `net::ice::udp_bind_addrs` 承担。

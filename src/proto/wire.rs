@@ -36,6 +36,8 @@ impl<'a> Field<'a> {
         }
     }
 
+    /// 目前只有终端 RPC 会按 varint 取值；`--no-default-features` 时没有使用者。
+    #[cfg_attr(not(feature = "terminal"), allow(dead_code))]
     pub fn int(&self) -> Option<u64> {
         match self.value {
             Value::Varint(value) => Some(value),

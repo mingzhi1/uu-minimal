@@ -6,6 +6,7 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -80,8 +81,9 @@ impl Signaling {
         let sender = tx.clone();
         tokio::spawn(async move {
             let mut counter = 10u64;
-            // 45/46 的文本头先到，二进制附件随后单独一帧。
-            let mut pending: Option<(String, Value)> = None;
+            // 45/46 的文本头先到，二进制附件随后单独一帧。用队列而不是单槽：
+            // 两个事件头之间插进来一个 ping 之类的文本帧，单槽会把前一个头覆盖掉。
+            let mut pending: VecDeque<(String, Value)> = VecDeque::new();
             let mut window = DEFAULT_PING_WINDOW;
             let mut deadline = tokio::time::Instant::now() + window;
             loop {
@@ -136,7 +138,11 @@ impl Signaling {
                                 .unwrap_or_default()
                                 .to_owned();
                             let header = parsed.as_ref().and_then(|v| v.get(1)).cloned().unwrap_or(Value::Null);
-                            pending = Some((name, header));
+                            // 附件不会连着来两批；超过 8 个未配对的头就是异常，丢掉最老的。
+                            if pending.len() >= 8 {
+                                pending.pop_front();
+                            }
+                            pending.push_back((name, header));
                         } else if let Some(rest) = text.strip_prefix("42") {
                             let Some(Value::Array(items)) = serde_json::from_str::<Value>(rest).ok() else { continue };
                             let name = items.first().and_then(Value::as_str).unwrap_or_default();
@@ -176,7 +182,7 @@ impl Signaling {
                     Message::Binary(bytes) => {
                         // 新版 Engine.IO 附件是裸 protobuf，老 SDK 带 0x04 前缀。
                         let data: &[u8] = if bytes.first() == Some(&4) { &bytes[1..] } else { &bytes };
-                        let Some((name, header)) = pending.take() else { continue };
+                        let Some((name, header)) = pending.pop_front() else { continue };
                         if name != "be-controlled" {
                             continue;
                         }

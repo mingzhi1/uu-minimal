@@ -1,7 +1,7 @@
 //! 极简参数解析：`--flag [value]` 加位置参数，没有短选项与 `--` 分隔符。
 
 /// 不带值的开关：解析位置参数时只跳过它本身，不吞下一个词。
-const BOOLEAN_FLAGS: [&str; 3] = ["--login", "--help", "--version"];
+const BOOLEAN_FLAGS: [&str; 4] = ["--login", "--help", "--version", "--json"];
 
 pub struct Args<'a> {
     items: &'a [String],

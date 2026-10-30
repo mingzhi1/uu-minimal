@@ -1,40 +1,42 @@
-//! viewer 侧 PeerConnection：发 offer、收 answer/candidate、开五条通道，
+//! 控制端 PeerConnection：发 offer、收 answer/candidate、开五条通道，
 //! 并在 FILE 通道上跑 `Message 27` 的多路流。
 
-use bytes::Bytes;
+use bytes::BytesMut;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
-use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::data_channel_state::RTCDataChannelState;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use webrtc::ice_transport::ice_credential_type::RTCIceCredentialType;
-use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
+use tokio::sync::{mpsc, oneshot, watch};
+use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState};
+use webrtc::peer_connection::{
+    MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfiguration, RTCConfigurationBuilder,
+    RTCIceCandidateInit, RTCIceServer, RTCIceTransportPolicy, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
+    RTCSessionDescription,
+};
 
 use super::signal::Signal;
 use crate::proto::{read_fields, Value as WireValue};
 
-pub const CHANNELS: [&str; 5] =
-    ["CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL", "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL"];
+pub const CHANNELS: [&str; 6] = [
+    "CONTROL_DATA_CHANNEL",
+    "TEXT_DATA_CHANNEL",
+    "STREAMER_DATA_CHANNEL",
+    "FILE_DATA_CHANNEL",
+    "BINARY_DATA_CHANNEL",
+    "FAST_DATA_CHANNEL",
+];
 pub const FILE_CHANNEL: usize = 3;
+pub const FAST_CHANNEL: usize = 5;
 const MESSAGE_FIELD: u32 = 27;
 const SYN: u64 = 0;
 const FIN: u64 = 1;
 const DATA: u64 = 2;
 const SYN_ACK: u64 = 3;
 const SESSION_ID: u64 = 1;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 等 SYN_ACK 的上限。官方 host 建连超时是 10s，但对我们没意义：
+/// 控制端本地 listener 已经和内核握完手，等太久只会表现为“连上了但没画面”。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// ack 里的 iceServers / force_relay → RTCConfiguration。
 /// 云端没给就用 host 候选，**不自造公共 STUN**。
@@ -55,22 +57,21 @@ pub fn configuration(ack: &Value) -> Result<RTCConfiguration, String> {
             continue;
         }
         let string = |key: &str| server.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
+        // 0.14 起没有 credential_type：TURN 固定按 long-term credential 处理。
         servers.push(RTCIceServer {
             urls,
             username: string("username"),
             credential: string("credential"),
-            credential_type: RTCIceCredentialType::Password,
         });
     }
     let relay = ack.get("force_relay").and_then(Value::as_bool).unwrap_or(false);
     if relay && !servers.iter().any(|s| s.urls.iter().any(|u| u.starts_with("turn:") || u.starts_with("turns:"))) {
         return Err("云端要求 relay-only，但没有 TURN".into());
     }
-    Ok(RTCConfiguration {
-        ice_servers: servers,
-        ice_transport_policy: if relay { RTCIceTransportPolicy::Relay } else { RTCIceTransportPolicy::All },
-        ..Default::default()
-    })
+    Ok(RTCConfigurationBuilder::new()
+        .with_ice_servers(servers)
+        .with_ice_transport_policy(if relay { RTCIceTransportPolicy::Relay } else { RTCIceTransportPolicy::All })
+        .build())
 }
 
 struct Flow {
@@ -78,9 +79,64 @@ struct Flow {
     ack: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
 }
 
+/// 快通道默认关闭：官方 host 不认这条通道，打开只在我们自己的 host 上有意义。
+fn fast_enabled() -> bool {
+    std::env::var("UU_FAST").map(|value| value == "1").unwrap_or(false)
+}
+
+/// 连接级事件（候选、状态、对端建的通道）。0.21 把 `set_*_handler(闭包)` 换成了实现
+/// `PeerConnectionEventHandler`，共享状态只能挂在 handler 上，通过 `with_handler` 交进去。
+struct Events {
+    signal: Arc<Signal>,
+    app_id: String,
+    ice_id: String,
+    remote: String,
+    flows: Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>,
+    /// 连接进 Failed/Disconnected/Closed 时置 true，让 CLI 立刻收工。
+    closed: watch::Sender<bool>,
+}
+
+#[async_trait::async_trait]
+impl PeerConnectionEventHandler for Events {
+    async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
+        let Ok(mut value) = event.candidate.to_json() else { return };
+        log::debug!("本地候选: {}", value.candidate);
+        // to_json() 不给 mid：我们的 offer 只有一条 bundled m-line（mid "0"）。
+        value.sdp_mid = Some("0".to_owned());
+        value.sdp_mline_index = Some(0);
+        let payload = json!({"client_id": self.remote, "data": {
+            "type": "candidate", "candidate": value, "ice_id": self.ice_id, "app_control_id": self.app_id}});
+        if let Err(e) = self.signal.soac(payload).await {
+            log::warn!("发送候选失败: {e}");
+        }
+    }
+
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        // 排查“通道没打开”时用来区分 ICE/DTLS 没通，还是对端不收这次连接。
+        log::info!("连接状态: {state:?}");
+        if matches!(
+            state,
+            RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed | RTCPeerConnectionState::Disconnected
+        ) {
+            // 控制端不做 ICE 重启：链路没了就让调用方报错退出，比干等超时好。
+            let _ = self.closed.send(true);
+        }
+    }
+
+    async fn on_data_channel(&self, channel: Arc<dyn DataChannel>) {
+        // 只有对端主动建的通道走这里；我们自建的通道在 new() 里自己挂泵。
+        let Ok(label) = channel.label().await else { return };
+        if label == CHANNELS[FILE_CHANNEL] {
+            let flows = self.flows.clone();
+            tokio::spawn(pump_file(channel, flows));
+        }
+    }
+}
+
 pub struct Peer {
-    pub pc: Arc<RTCPeerConnection>,
-    pub channels: Vec<Arc<RTCDataChannel>>,
+    pub pc: Arc<dyn PeerConnection>,
+    pub channels: Vec<Arc<dyn DataChannel>>,
+    fast: Arc<crate::net::fast::FastLink>,
     app_id: String,
     ice_id: String,
     remote: String,
@@ -91,71 +147,90 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub async fn new(config: RTCConfiguration, app_id: String, ice_id: String, remote: String, signal: Arc<Signal>) -> Result<Self, String> {
-        let api = APIBuilder::new().with_media_engine(MediaEngine::default()).build();
-        let pc = Arc::new(api.new_peer_connection(config).await.map_err(|e| format!("创建 PeerConnection 失败: {e}"))?);
-
-        let (app, ice, client) = (app_id.clone(), ice_id.clone(), remote.clone());
-        let weak = Arc::downgrade(&pc);
-        pc.on_ice_candidate(Box::new(move |candidate: Option<webrtc::ice_transport::ice_candidate::RTCIceCandidate>| {
-            let (weak, signal, app, ice, client) = (weak.clone(), signal.clone(), app.clone(), ice.clone(), client.clone());
-            Box::pin(async move {
-                let Some(candidate) = candidate else { return };
-                let Ok(mut value) = candidate.to_json() else { return };
-                // 回调可能不带 MID：绑定到 answer/offer 的第一个 bundled m-line。
-                if let Some(pc) = weak.upgrade() {
-                    if let Some(local) = pc.local_description().await {
-                        if let Some(mid) = local.sdp.lines().find_map(|line| line.strip_prefix("a=mid:")) {
-                            value.sdp_mid = Some(mid.trim().to_owned());
-                            value.sdp_mline_index = Some(0);
-                        }
-                    }
-                }
-                let payload = json!({"client_id": client, "data": {
-                    "type": "candidate", "candidate": value, "ice_id": ice, "app_control_id": app}});
-                if let Err(e) = signal.soac(payload).await {
-                    log::warn!("发送候选失败: {e}");
-                }
-            })
-        }));
-
+    pub async fn new(
+        config: RTCConfiguration,
+        app_id: String,
+        ice_id: String,
+        remote: String,
+        signal: Arc<Signal>,
+        closed: watch::Sender<bool>,
+    ) -> Result<Self, String> {
         let flows: Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        // 快通道：无序 + 只重传一次。丢包不再阻塞后续消息，配合 `net::fast` 的
+        // 块级 FEC 和 NACK，避免有序 SCTP 上“一丢就整条流停住”。
+        let (fast_inbox, mut fast_rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+        let fast = crate::net::fast::FastLink::new(fast_inbox);
         {
             let flows = flows.clone();
-            pc.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
-                if channel.label() == CHANNELS[FILE_CHANNEL] {
-                    let flows = flows.clone();
-                    channel.on_message(Box::new(move |message: DataChannelMessage| {
-                        let flows = flows.clone();
-                        Box::pin(async move { dispatch_flow(&flows, &message.data) })
-                    }));
+            tokio::spawn(async move {
+                while let Some((stream, payload)) = fast_rx.recv().await {
+                    let key = (u64::from(stream), 1u64);
+                    let flow = flows.lock().unwrap().get(&key).cloned();
+                    let Some(flow) = flow else { continue };
+                    // 空载荷 = 对端 FIN：丢登记，FlowReader 随通道关闭返回 None。
+                    if payload.is_empty() {
+                        flows.lock().unwrap().remove(&key);
+                        continue;
+                    }
+                    if flow.data.send(payload).await.is_err() {
+                        flows.lock().unwrap().remove(&key);
+                    }
                 }
-                Box::pin(async {})
-            }));
+            });
         }
 
-        let mut channels = Vec::with_capacity(CHANNELS.len());
-        for label in CHANNELS {
-            let channel = pc
-                .create_data_channel(label, Some(RTCDataChannelInit { ordered: Some(true), ..Default::default() }))
+        let events = Arc::new(Events {
+            signal,
+            app_id: app_id.clone(),
+            ice_id: ice_id.clone(),
+            remote: remote.clone(),
+            flows: flows.clone(),
+            closed,
+        });
+        let pc: Arc<dyn PeerConnection> = Arc::new(
+            PeerConnectionBuilder::<std::net::SocketAddr>::new()
+                .with_configuration(config)
+                .with_media_engine(MediaEngine::default())
+                .with_udp_addrs(crate::net::ice::udp_bind_addrs())
+                .with_handler(events)
+                .build()
                 .await
-                .map_err(|e| format!("创建 data channel {label} 失败: {e}"))?;
+                .map_err(|e| format!("创建 PeerConnection 失败: {e}"))?,
+        );
+
+        let mut channels: Vec<Arc<dyn DataChannel>> = Vec::with_capacity(CHANNELS.len());
+        for (index, label) in CHANNELS.iter().enumerate() {
+            // 快通道默认关闭（`UU_FAST=1` 打开）。不开时 host 侧 `FastLink` 永远未就绪，
+            // 端口映射自动回退到 FILE 通道，官方 host 的行为不受影响。
+            if index == FAST_CHANNEL && !fast_enabled() {
+                continue;
+            }
+            // 0.21 的 `ordered` 是 bool（不再是 Option）。
+            let init = if index == FAST_CHANNEL {
+                RTCDataChannelInit { ordered: false, max_retransmits: Some(1), ..Default::default() }
+            } else {
+                RTCDataChannelInit { ordered: true, ..Default::default() }
+            };
+            let channel = pc.create_data_channel(label, Some(init)).await.map_err(|e| format!("创建 data channel {label} 失败: {e}"))?;
+            if index == FAST_CHANNEL {
+                fast.attach(channel.clone());
+                tokio::spawn(pump_fast(channel.clone(), fast.clone()));
+            }
             channels.push(channel);
         }
 
         {
-            // `on_data_channel` 只在远端建通道时触发；自己 create 的通道必须自己挂 on_message，
+            // `on_data_channel` 只在远端建通道时触发；自己 create 的通道要自己起事件泵，
             // 否则 FILE 通道上的 Message 27（SYN_ACK/DATA）全部收不到。
             let flows = flows.clone();
-            channels[FILE_CHANNEL].on_message(Box::new(move |message: DataChannelMessage| {
-                let flows = flows.clone();
-                Box::pin(async move { dispatch_flow(&flows, &message.data) })
-            }));
+            tokio::spawn(pump_file(channels[FILE_CHANNEL].clone(), flows));
         }
 
         Ok(Self {
             pc,
             channels,
+            fast,
             app_id,
             ice_id,
             remote,
@@ -169,13 +244,12 @@ impl Peer {
     /// offer 必须在 host 处理完 `be-controlled` 之后才发（官方 host 会丢弃未知 ice_id 的 offer）。
     pub async fn offer(&self) -> Result<Value, String> {
         let offer = self.pc.create_offer(None).await.map_err(|e| format!("生成 offer 失败: {e}"))?;
-        let mut sdp = offer.sdp.clone();
+        // 官方 viewer 的 offer 都带 `a=x-uuremote-quic`。实测缺了它官方 host 照样回 answer，
+        // 但 data channel 一直不 Open（SYN 收不到 SYN_ACK），所以这行是必须的。
+        let sdp = with_quic_flag(&offer.sdp);
+        log::debug!("offer SDP:\n{sdp}");
+        // 必须先交出原始 SDP 再改字符串：webrtc-rs 不接受被改过的 local description。
         self.pc.set_local_description(offer).await.map_err(|e| format!("设置本地 SDP 失败: {e}"))?;
-        if !sdp.contains("a=x-uuremote-quic") {
-            if let Some(index) = sdp.find("a=group:BUNDLE") {
-                sdp.insert_str(index, "a=x-uuremote-quic\r\n");
-            }
-        }
         Ok(json!({"client_id": self.remote, "data": {
             "type": "offer",
             "sdp": crate::net::peer::with_max_message_size(&sdp),
@@ -203,6 +277,7 @@ impl Peer {
                     return Ok(());
                 }
                 let sdp = answer_sdp(body)?;
+                log::debug!("answer SDP:\n{sdp}");
                 let answer = RTCSessionDescription::answer(sdp).map_err(|e| format!("answer 无效: {e}"))?;
                 self.pc.set_remote_description(answer).await.map_err(|e| format!("设置远端 SDP 失败: {e}"))?;
                 // 先把队列取空再 await：MutexGuard 跨 await 会让 future 不是 Send。
@@ -238,10 +313,24 @@ impl Peer {
         Ok(())
     }
 
+    /// 各通道当前状态（标签, Connecting/Open/…）。通道打不开时用来区分是对端没开，
+    /// 还是只开了其中几条。0.21 起 `ready_state()` 是异步的。
+    pub async fn channel_states(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::with_capacity(self.channels.len());
+        for (channel, label) in self.channels.iter().zip(CHANNELS.iter()) {
+            let state = match channel.ready_state().await {
+                Ok(state) => format!("{state:?}"),
+                Err(e) => format!("<{e}>"),
+            };
+            out.push((*label, state));
+        }
+        out
+    }
+
     pub async fn wait_channel(&self, index: usize, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.channels[index].ready_state() == RTCDataChannelState::Open {
+            if matches!(self.channels[index].ready_state().await, Ok(RTCDataChannelState::Open)) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -252,10 +341,10 @@ impl Peer {
     }
 
     async fn send_file(&self, message: Vec<u8>) -> Result<(), String> {
+        // 0.21 的 `send` 收 `BytesMut`（不再是 `&Bytes`）。
         self.channels[FILE_CHANNEL]
-            .send(&Bytes::from(message))
+            .send(BytesMut::from(&message[..]))
             .await
-            .map(|_| ())
             .map_err(|e| format!("FILE 通道发送失败: {e}"))
     }
 
@@ -315,13 +404,22 @@ impl FlowHandle {
 
 impl FlowWriter {
     pub async fn send(&self, data: &[u8]) -> Result<(), String> {
-        for chunk in data.chunks(16 * 1024) {
+        for chunk in data.chunks(crate::net::fast::MAX_PAYLOAD) {
+            // 快通道可用就走无序 + FEC；否则回退到 FILE（官方 host / 未开启 UU_FAST）。
+            if self.peer.fast.send(self.rule as u32, chunk).await {
+                continue;
+            }
             self.peer.send_file(frame(self.rule, self.stream, DATA, chunk)).await?;
         }
         Ok(())
     }
 
     pub async fn fin(&self) -> Result<(), String> {
+        // 走快通道的流，FIN 也要跟着快通道走：否则有序通道上的 FIN 会插到还在途的
+        // 无序数据前面，接收端提前关流就把尾部数据丢了。
+        if self.peer.fast.send_fin(self.rule as u32).await {
+            return Ok(());
+        }
         self.peer.send_file(frame(self.rule, self.stream, FIN, &[])).await
     }
 }
@@ -333,7 +431,29 @@ impl FlowReader {
     }
 }
 
-fn dispatch_flow(flows: &Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>, data: &[u8]) {
+/// FILE 通道的事件泵：0.21 没有 `on_message` 回调了，改成一个任务不停 `poll()`。
+/// 一条通道只能有一个消费者，所以自建的通道在 `new()` 里起，对端建的在 handler 里起。
+async fn pump_file(channel: Arc<dyn DataChannel>, flows: Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>) {
+    while let Some(event) = channel.poll().await {
+        if let DataChannelEvent::OnMessage(message) = event {
+            dispatch_flow(&flows, &message.data).await;
+        }
+    }
+}
+
+/// 快通道的事件泵：吃掉无序块，交给 `net::fast` 去重排/校验。
+async fn pump_fast(channel: Arc<dyn DataChannel>, fast: Arc<crate::net::fast::FastLink>) {
+    while let Some(event) = channel.poll().await {
+        if let DataChannelEvent::OnMessage(message) = event {
+            fast.feed(&message.data).await;
+        }
+    }
+}
+
+/// 收帧回调。DATA 必须**阻塞发送**：`try_send` 在 256 帧（4 MiB）用满时会静默丢字节，
+/// 而这层下面是一条 TCP 字节流，丢一个字节就等于把协议啃出空洞（花屏、握手失败）。
+/// 阻塞会把背压交给 SCTP 窗口，代价只是本通道回调变慢。
+async fn dispatch_flow(flows: &Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>, data: &[u8]) {
     let Ok(fields) = read_fields(data) else { return };
     let Some(WireValue::Bytes(raw)) = fields.iter().find(|f| f.number == MESSAGE_FIELD).map(|f| &f.value) else { return };
     let Ok(frame) = read_fields(raw) else { return };
@@ -352,7 +472,10 @@ fn dispatch_flow(flows: &Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>, data: &[u8]
     };
     match kind {
         DATA => {
-            let _ = flow.data.try_send(payload);
+            if flow.data.send(payload).await.is_err() {
+                // 本地读端已经退出（对端 FIN 或 socket 关闭），把登记一起清掉。
+                flows.lock().unwrap().remove(&(rule, stream));
+            }
         }
         FIN => {
             flows.lock().unwrap().remove(&(rule, stream));
@@ -407,6 +530,26 @@ fn bytes(field: u32, value: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(value);
 }
 
+/// 在 `a=group:BUNDLE` 之前插入 `a=x-uuremote-quic`（官方 viewer 的 offer 形态）。
+fn with_quic_flag(sdp: &str) -> String {
+    let eol = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
+    let marker = "a=group:BUNDLE";
+    if sdp.contains("a=x-uuremote-quic") {
+        return sdp.to_owned();
+    }
+    match sdp.find(marker) {
+        Some(at) => {
+            let mut out = String::with_capacity(sdp.len() + marker.len());
+            out.push_str(&sdp[..at]);
+            out.push_str("a=x-uuremote-quic");
+            out.push_str(eol);
+            out.push_str(&sdp[at..]);
+            out
+        }
+        None => sdp.to_owned(),
+    }
+}
+
 /// 官方 host 可能回 gzip_sdp（base64 + gzip）。
 fn answer_sdp(body: &Value) -> Result<String, String> {
     if let Some(sdp) = body.get("sdp").and_then(Value::as_str) {
@@ -449,10 +592,20 @@ mod tests {
     }
 
     #[test]
+    fn quic_flag_goes_before_the_bundle_group_and_is_idempotent() {
+        let sdp = "v=0\r\na=group:BUNDLE 0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
+        let out = with_quic_flag(sdp);
+        assert!(out.contains("a=x-uuremote-quic\r\na=group:BUNDLE 0\r\n"));
+        // 没有 BUNDLE 段时原样返回，免得插到非法位置。
+        assert_eq!(with_quic_flag("v=0\r\n"), "v=0\r\n");
+        assert_eq!(with_quic_flag(&out), out);
+    }
+
+    #[test]
     fn ice_configuration_rejects_relay_without_turn() {
         assert!(configuration(&json!({"force_relay": true})).is_err());
         let ok = configuration(&json!({"iceServers": [{"urls": "stun:127.0.0.1:3478"}]})).unwrap();
-        assert_eq!(ok.ice_servers.len(), 1);
-        assert_eq!(configuration(&json!({})).unwrap().ice_servers.len(), 0);
+        assert_eq!(ok.ice_servers().len(), 1);
+        assert_eq!(configuration(&json!({})).unwrap().ice_servers().len(), 0);
     }
 }

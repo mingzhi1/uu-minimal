@@ -8,7 +8,12 @@ use crate::cli::ui;
 use crate::cloud::api::Api;
 use crate::cloud::config;
 use crate::cloud::creds::Credentials;
-use crate::net::viewer::{self, rtc::FlowHandle, ssh as russh_client};
+use crate::net::controller::{self, rtc::FlowHandle, ssh as russh_client};
+
+/// 信令或 WebRTC 链路断开时的统一提示（控制端不做重连，交给用户重跑）。
+fn link_lost() -> String {
+    "连接已断开：信令或 WebRTC 链路丢失".into()
+}
 
 pub async fn portmap_command(args: &[String]) -> Result<(), String> {
     let args = Args::new(args);
@@ -25,15 +30,20 @@ pub async fn portmap_command(args: &[String]) -> Result<(), String> {
 pub async fn portmap_run(device: &str, local: u16, host: &str, port: u16) -> Result<(), String> {
     let host = host.to_owned();
     let api = loaded_api()?;
-    let session = viewer::join(&api, device, viewer::signal::CAPTURE_PORT_MAP).await?;
+    let session = controller::join(&api, device, controller::signal::CAPTURE_PORT_MAP).await?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", local))
         .await
         .map_err(|e| format!("监听 127.0.0.1:{local} 失败: {e}"))?;
     println!("{}", ui::bold("隧道就绪"));
     println!("  127.0.0.1:{local} → {host}:{port}");
     ui::hint("  Ctrl-C 退出");
+    let mut closed = session.closed.clone();
     loop {
-        let (socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        // 信令/WebRTC 断了就不再接新连接：否则本地 accept 成功、对端却永远没数据。
+        let (socket, _) = tokio::select! {
+            _ = closed.changed() => return Err(link_lost()),
+            accepted = listener.accept() => accepted.map_err(|e| e.to_string())?,
+        };
         let peer = session.peer.clone();
         let host = host.clone();
         tokio::spawn(async move {
@@ -86,15 +96,20 @@ async fn ssh_session(
 ) -> Result<(), String> {
     let user = if user.trim().is_empty() { current_user() } else { user.trim().to_owned() };
     let api = loaded_api()?;
-    let session = viewer::join(&api, device, viewer::signal::CAPTURE_PORT_MAP).await?;
+    let session = controller::join(&api, device, controller::signal::CAPTURE_PORT_MAP).await?;
     let flow = session.peer.open_flow(host, port).await?;
     let known_hosts = config::path().with_file_name("known_hosts");
-    russh_client::run(
+    let mut closed = session.closed.clone();
+    let run = russh_client::run(
         flow,
         host,
         russh_client::Options { user, port, password, key, command, known_hosts },
-    )
-    .await
+    );
+    tokio::select! {
+        result = run => result,
+        // 链路断了要报错退出，不能让本地终端卡在一个已经死掉的会话上。
+        _ = closed.changed() => Err(link_lost()),
+    }
 }
 
 /// stdio 桥：给 `ssh -o ProxyCommand=…` / `sftp -o ProxyCommand=…` 用。
@@ -110,7 +125,7 @@ pub async fn tunnel_command(args: &[String]) -> Result<(), String> {
     let port: u16 = positional[1].parse().map_err(|_| "端口无效".to_string())?;
 
     let api = loaded_api()?;
-    let session = viewer::join(&api, device, viewer::signal::CAPTURE_PORT_MAP).await?;
+    let session = controller::join(&api, device, controller::signal::CAPTURE_PORT_MAP).await?;
     let flow = session.peer.open_flow(host, port).await?;
     let (writer, mut reader) = flow.into_parts();
 
@@ -140,9 +155,12 @@ pub async fn tunnel_command(args: &[String]) -> Result<(), String> {
             let _ = stdout.flush().await;
         }
     };
+    let mut closed = session.closed.clone();
     tokio::select! {
         _ = up => {}
         _ = down => {}
+        // stdio 桥是给 `ssh`/`sftp` 当 ProxyCommand 用的：链路断了必须非零退出。
+        _ = closed.changed() => return Err(link_lost()),
     }
     Ok(())
 }
