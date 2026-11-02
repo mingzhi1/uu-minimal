@@ -26,6 +26,7 @@ use crate::proto::{self, Value as WireValue};
 
 const FILE_DATA_CHANNEL: &str = "FILE_DATA_CHANNEL";
 const BINARY_DATA_CHANNEL: &str = "BINARY_DATA_CHANNEL";
+const CONTROL_DATA_CHANNEL: &str = "CONTROL_DATA_CHANNEL";
 /// 无序快通道（块级 FEC + NACK），只在我们自己的 viewer 打开 `UU_FAST=1` 时出现。
 const FAST_DATA_CHANNEL: &str = "FAST_DATA_CHANNEL";
 
@@ -391,6 +392,14 @@ async fn dispatch(
         return;
     }
     let Ok(fields) = proto::read_fields(&data) else { return };
+    // CONTROL 上的 `Message 3 { 4: {...} }` 是遥控端的能力协商，每 500ms 重发一次直到被应答。
+    // 官方 host 的做法是原样回显（`CONTROL protobuf echo request answered`）。不回的话遥控端
+    // 停在握手阶段，FILE / TEXT / BINARY 一个字节都不发——端口映射和文件传输都表现为
+    // 「通道全 Open 但什么都不能干」，而终端走 BINARY 裸帧，所以一直是好的。
+    if label == CONTROL_DATA_CHANNEL {
+        let _ = outbox.send((label.to_owned(), data));
+        return;
+    }
     // 文件传输（Message 21 字段 8 / Message 22 字段 4）自己认领，认不出就往下走。
     if files.handle(&fields).await {
         return;

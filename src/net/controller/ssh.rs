@@ -264,11 +264,13 @@ fn append_pin(store: &Path, host: &str, port: u16, fingerprint: &str) {
 }
 
 /// 本地终端 raw 模式，Drop 时恢复。
+#[cfg(unix)]
 struct RawMode {
     saved: libc::termios,
     active: bool,
 }
 
+#[cfg(unix)]
 impl RawMode {
     fn enable() -> Self {
         unsafe {
@@ -284,6 +286,7 @@ impl RawMode {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawMode {
     fn drop(&mut self) {
         if self.active {
@@ -294,6 +297,20 @@ impl Drop for RawMode {
     }
 }
 
+/// Windows 控制台没有 termios：不切 raw 模式（交互式 ssh 的按键会由控制台自己处理）。
+#[cfg(not(unix))]
+struct RawMode {
+    active: bool,
+}
+
+#[cfg(not(unix))]
+impl RawMode {
+    fn enable() -> Self {
+        Self { active: false }
+    }
+}
+
+#[cfg(unix)]
 fn window_size() -> (u32, u32) {
     unsafe {
         let mut size: libc::winsize = std::mem::zeroed();
@@ -305,6 +322,11 @@ fn window_size() -> (u32, u32) {
     }
 }
 
+#[cfg(not(unix))]
+fn window_size() -> (u32, u32) {
+    (80, 24)
+}
+
 fn prompt_password(user: &str) -> Option<String> {
     use std::io::{BufRead, Write};
     if !stdin_is_tty() {
@@ -312,26 +334,58 @@ fn prompt_password(user: &str) -> Option<String> {
     }
     print!("{user} 的密码: ");
     let _ = io::stdout().flush();
-    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-    let active = unsafe { libc::tcgetattr(0, &mut saved) } == 0;
-    if active {
-        let mut quiet = saved;
-        quiet.c_lflag &= !libc::ECHO;
-        unsafe {
-            libc::tcsetattr(0, libc::TCSANOW, &quiet);
-        }
-    }
+    let guard = EchoOff::enable();
     let mut line = String::new();
     let _ = io::stdin().lock().read_line(&mut line);
-    if active {
-        unsafe {
-            libc::tcsetattr(0, libc::TCSANOW, &saved);
-        }
-    }
+    drop(guard);
     println!();
     Some(line.trim_end_matches(['\r', '\n']).to_owned()).filter(|text| !text.is_empty())
 }
 
 fn stdin_is_tty() -> bool {
-    unsafe { libc::isatty(0) == 1 }
+    crate::cli::ui::stdin_is_tty()
+}
+
+/// 关掉终端回显，Drop 时恢复（Unix）。Windows 上不回显由控制台自己负责，这里是空实现。
+#[cfg(unix)]
+struct EchoOff {
+    saved: libc::termios,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl EchoOff {
+    fn enable() -> Self {
+        unsafe {
+            let mut saved: libc::termios = std::mem::zeroed();
+            let active = libc::tcgetattr(0, &mut saved) == 0;
+            if active {
+                let mut quiet = saved;
+                quiet.c_lflag &= !libc::ECHO;
+                libc::tcsetattr(0, libc::TCSANOW, &quiet);
+            }
+            Self { saved, active }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                libc::tcsetattr(0, libc::TCSANOW, &self.saved);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct EchoOff;
+
+#[cfg(not(unix))]
+impl EchoOff {
+    fn enable() -> Self {
+        Self
+    }
 }

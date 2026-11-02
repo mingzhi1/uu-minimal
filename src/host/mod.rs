@@ -43,6 +43,7 @@ pub async fn run() -> Result<(), String> {
     let api = Arc::new(Api::new(creds));
 
     let mut attempt = 0u32;
+    let mut stopping = false;
     'rooms: loop {
         log::info!("向云端申请房间凭据…");
         let room = match api.create_room().await {
@@ -71,6 +72,10 @@ pub async fn run() -> Result<(), String> {
             }
         };
         let started = Instant::now();
+        // 云端回收房间（房间级 `leave`）与真掉线分开计：前者是我们自己就要重建，
+        // 不是故障。与前者一起累加退避的话，连着被回收几次之后每次都要等 30s，
+        // 期间设备在云端就是离线的——别人再发起远控只会看到一直「正在连接」。
+        let mut recycle = false;
 
         // 一个 ice_id = 一个 peer（桌面 / 文件 / 终端 / 端口映射各一条）。
         // pending_ice 带时间戳：凭据过期后不能拿来建连。
@@ -82,7 +87,7 @@ pub async fn run() -> Result<(), String> {
 
         loop {
             let event = tokio::select! {
-                _ = tokio::signal::ctrl_c() => break 'rooms,
+                _ = tokio::signal::ctrl_c() => { stopping = true; break },
                 event = rx.recv() => match event { Some(event) => event, None => break },
             };
             match event {
@@ -124,7 +129,7 @@ pub async fn run() -> Result<(), String> {
                             // 同一 ice_id 重连时替换旧连接；guard 不能跨 await，先取出来再关。
                             let old = { peers.lock().unwrap().insert(ice_id.clone(), pc) };
                             if let Some(old) = old {
-                                let _ = old.close().await;
+                                close_peer(&old).await;
                             }
                             let count = peers.lock().unwrap().len();
                             log::info!("已回复 answer: ice_id_present={} peers={count}", !ice_id.is_empty());
@@ -144,46 +149,41 @@ pub async fn run() -> Result<(), String> {
                         None => log::warn!("收到未知 ice_id 的候选，忽略"),
                     }
                 }
-                Event::Released(data) => {
-                    let ice_id = ["ice_id", "iceId"].iter().find_map(|k| data.get(*k)).and_then(Value::as_str).map(str::to_owned);
-                    log::info!("遥控端断开: ice_id_present={}", ice_id.is_some());
-                    // 顺手清掉还没等到 offer 的 ICE 配置，别把过期凭据留给下一次连接。
-                    match &ice_id {
-                        Some(id) => {
-                            pending_ice.remove(id);
-                        }
-                        None => {
-                            pending_ice.clear();
-                            fallback_ice = None;
-                        }
-                    }
-                    let closing: Vec<String> = match &ice_id {
-                        Some(id) => vec![id.clone()],
-                        None => peers.lock().unwrap().keys().cloned().collect(),
-                    };
-                    for id in closing {
-                        let pc = { peers.lock().unwrap().remove(&id) };
-                        if let Some(pc) = pc {
-                            let _ = pc.close().await;
-                        }
+                Event::Released(id) => {
+                    log::info!("遥控端断开（仅清理对应连接）");
+                    pending_ice.remove(&id);
+                    let pc = { peers.lock().unwrap().remove(&id) };
+                    if let Some(pc) = pc {
+                        close_peer(&pc).await;
                     }
                 }
                 Event::Closed => {
                     log::warn!("信令断开，重建房间");
+                    recycle = true;
                     break;
                 }
             }
         }
 
+        // 先把信令拆干净再重建：旧 WebSocket 留着，云端会把新房间的 leave 当成这台的。
+        signaling.shutdown();
         let drained: Vec<Arc<dyn webrtc::peer_connection::PeerConnection>> = {
             peers.lock().unwrap().drain().map(|(_, pc)| pc).collect()
         };
         for pc in drained {
-            let _ = pc.close().await;
+            close_peer(&pc).await;
+        }
+        drop(signaling);
+        if stopping {
+            break 'rooms;
         }
         // 活得够久说明链路是通的：重置退避，掉线后能快速回来；连上就断则继续累加，
         // 不会对云端形成 1s 一次的重试风暴。
-        attempt = if started.elapsed() >= STABLE_SESSION { 0 } else { attempt.saturating_add(1) };
+        attempt = if recycle || started.elapsed() >= STABLE_SESSION {
+            0
+        } else {
+            attempt.saturating_add(1)
+        };
         let delay = backoff(attempt.max(1));
         log::info!("{}s 后重建房间", delay.as_secs());
         tokio::time::sleep(delay).await;
@@ -196,6 +196,13 @@ pub async fn run() -> Result<(), String> {
 
 fn value_text(value: &Value) -> String {
     value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())
+}
+
+/// `close()` 在连接已经卡死时可能一直不返回；卡住它会把整个重建房间的流程堵住。
+async fn close_peer(pc: &Arc<dyn webrtc::peer_connection::PeerConnection>) {
+    if tokio::time::timeout(Duration::from_secs(10), pc.close()).await.is_err() {
+        log::warn!("关闭旧连接超时，继续恢复房间");
+    }
 }
 
 // ---------------------------------------------------------------- 客户端子命令

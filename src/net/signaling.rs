@@ -47,17 +47,55 @@ pub enum Event {
     Connect { capture_type: u64, ice_id: Option<String>, ice: SessionIce },
     Offer(Soac),
     Candidate(Soac),
-    /// 遥控端离开 / 房间被回收。
-    Released(Value),
-    /// 连接已断，需要重新建房。
+    /// 遥控端离开；只清理这一条 peer，房间还能继续接下一次连接。
+    Released(String),
+    /// 连接已断或房间被云端回收，需要重新建房。
     Closed,
+}
+
+/// 云端下发的 `released` / `left` / `leave` 分两种：带 `ice_id` 的是某个遥控端断开，
+/// 不带（或空串）的是**房间级**事件——云端已经把整个房间收掉了。
+///
+/// 后者必须当成断线处理：继续守着这个房间等 offer，设备在云端就一直显示离线，
+/// 别的机器再发起远控只会拿到 2001「被控设备不在线」，端口映射停在「正在连接」。
+fn release_event(name: &str, data: &Value) -> Event {
+    let id = ["ice_id", "iceId"]
+        .iter()
+        .filter_map(|key| data.get(*key))
+        .find_map(|value| match value {
+            Value::String(id) if !id.is_empty() => Some(id.clone()),
+            Value::Number(id) => Some(id.to_string()),
+            _ => None,
+        });
+    log::info!("云端离开事件: event={name} ice_id_present={}", id.is_some());
+    match id {
+        Some(id) => Event::Released(id),
+        None => Event::Closed,
+    }
 }
 
 pub struct Signaling {
     tx: mpsc::Sender<String>,
+    /// 读 / 写两个任务。房间级离开后要主动中止它们：
+    /// 旧 WebSocket 留着不收，云端会把这个设备的两条信令当成同一个人，
+    /// 于是新房间收到的 `leave` 又会把新连接踢掉。
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for Signaling {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 impl Signaling {
+    /// 立即拆掉链路。重建房间前必须调，不能只等 Drop（Arc 可能还被别的任务持着）。
+    pub fn shutdown(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+
     pub async fn connect(url: &str, room_token: &str, events: mpsc::Sender<Event>) -> Result<Arc<Self>, String> {
         let ws_url = format!("{}/socket.io/?transport=websocket&EIO=4", url.trim_end_matches('/'));
         let mut request = ws_url.into_client_request().map_err(|_| "信令 URL 无效")?;
@@ -69,7 +107,7 @@ impl Signaling {
         let (mut write, mut read) = socket.split();
         let (tx, mut rx) = mpsc::channel::<String>(32);
 
-        tokio::spawn(async move {
+        let writer = tokio::spawn(async move {
             while let Some(packet) = rx.recv().await {
                 match tokio::time::timeout(SEND_TIMEOUT, write.send(Message::Text(packet))).await {
                     Ok(Ok(())) => {}
@@ -79,7 +117,7 @@ impl Signaling {
         });
 
         let sender = tx.clone();
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             let mut counter = 10u64;
             // 45/46 的文本头先到，二进制附件随后单独一帧。用队列而不是单槽：
             // 两个事件头之间插进来一个 ping 之类的文本帧，单槽会把前一个头覆盖掉。
@@ -171,7 +209,9 @@ impl Signaling {
                                     }
                                 }
                                 "released" | "left" | "leave" => {
-                                    if events.send(Event::Released(data)).await.is_err() {
+                                    let event = release_event(name, &data);
+                                    let room_closed = matches!(event, Event::Closed);
+                                    if events.send(event).await.is_err() || room_closed {
                                         break;
                                     }
                                 }
@@ -210,7 +250,7 @@ impl Signaling {
             }
         });
 
-        Ok(Arc::new(Self { tx }))
+        Ok(Arc::new(Self { tx, tasks: vec![writer.abort_handle(), reader.abort_handle()] }))
     }
 
     pub async fn emit(&self, packet: String) -> Result<(), String> {
@@ -273,7 +313,55 @@ fn read_varint(bytes: &[u8], mut i: usize) -> Option<(u64, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::protobuf_varint;
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn room_scoped_leave_means_reconnect_peer_scoped_leave_does_not() {
+        // 云端回收房间时下发的 `leave` 里 ice_id 是空串（真机上实测就是这个形态）。
+        for data in [json!({}), json!({"ice_id": ""}), Value::Null] {
+            assert!(matches!(release_event("leave", &data), Event::Closed));
+        }
+        // 单个遥控端断开：只清这条 peer，房间继续用。
+        assert!(matches!(release_event("left", &json!({"ice_id": "42"})), Event::Released(id) if id == "42"));
+        assert!(matches!(release_event("released", &json!({"iceId": 42})), Event::Released(id) if id == "42"));
+    }
+
+    /// 房间级 `leave` 必须让房间循环收到 Event::Closed；`shutdown()` 随后真正断开连接。
+    /// 少了这一步，循环会一直守着被云端回收的房间（设备显示离线，别人连不进来）。
+    #[tokio::test]
+    async fn server_room_leave_ends_the_signaling_session() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Text("0{\"pingInterval\":25000,\"pingTimeout\":20000}".into())).await.unwrap();
+            socket.send(Message::Text("40{}".into())).await.unwrap();
+            socket.send(Message::Text("42[\"leave\",{\"ice_id\":\"\"}]".into())).await.unwrap();
+            // 服务端不主动断 WebSocket：客户端自己放弃这个房间，连接就该结束。
+            while let Some(Ok(message)) = socket.next().await {
+                match &message {
+                    // 客户端自己发的握手 / room_info / 心跳应答，不算结束。
+                    Message::Text(text) if text == "40" || text.starts_with('3') || text.contains("room_info") => {}
+                    _ => return false,
+                }
+            }
+            true
+        });
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let signal = Signaling::connect(&format!("ws://{address}"), "test", tx).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            assert!(matches!(rx.recv().await, Some(Event::Connected)));
+            assert!(matches!(rx.recv().await, Some(Event::Closed)));
+            assert!(rx.recv().await.is_none());
+        })
+        .await
+        .unwrap();
+        signal.shutdown();
+        assert!(tokio::time::timeout(Duration::from_secs(3), server).await.unwrap().unwrap());
+    }
 
     #[test]
     fn reads_field_one_varint_and_skips_other_fields() {

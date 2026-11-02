@@ -453,6 +453,9 @@ async fn pump_fast(channel: Arc<dyn DataChannel>, fast: Arc<crate::net::fast::Fa
 /// 收帧回调。DATA 必须**阻塞发送**：`try_send` 在 256 帧（4 MiB）用满时会静默丢字节，
 /// 而这层下面是一条 TCP 字节流，丢一个字节就等于把协议啃出空洞（花屏、握手失败）。
 /// 阻塞会把背压交给 SCTP 窗口，代价只是本通道回调变慢。
+/// 流结束后仍有零星在途帧到达时，不该把日志刷满：只在第一次提醒。
+static ORPHAN_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 async fn dispatch_flow(flows: &Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>, data: &[u8]) {
     let Ok(fields) = read_fields(data) else { return };
     let Some(WireValue::Bytes(raw)) = fields.iter().find(|f| f.number == MESSAGE_FIELD).map(|f| &f.value) else { return };
@@ -467,7 +470,11 @@ async fn dispatch_flow(flows: &Arc<Mutex<HashMap<(u64, u64), Arc<Flow>>>>, data:
         .unwrap_or_default();
     let flow = flows.lock().unwrap().get(&(rule, stream)).cloned();
     let Some(flow) = flow else {
-        log::warn!("端口映射帧没有对应的流，忽略");
+        // 流结束后还有在途帧是正常的（FIN 与 DATA 可能交叉）。只在第一次提醒，
+        // 否则一条满载流断开后会刷出几千行同样的日志。
+        if !ORPHAN_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::debug!("端口映射收到已关闭流的帧（后续同类帧不再打印）");
+        }
         return;
     };
     match kind {

@@ -7,12 +7,36 @@ use std::sync::OnceLock;
 
 /// stdin 是否是终端：决定要不要进交互菜单。
 pub fn is_tty() -> bool {
+    stdin_is_tty()
+}
+
+#[cfg(unix)]
+pub fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(0) == 1 }
+}
+
+#[cfg(not(unix))]
+pub fn stdin_is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 fn color_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("NO_COLOR").is_none() && unsafe { libc::isatty(1) } == 1)
+    *ON.get_or_init(|| {
+        std::env::var_os("NO_COLOR").is_none()
+            && {
+                #[cfg(unix)]
+                {
+                    unsafe { libc::isatty(1) == 1 }
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::io::IsTerminal;
+                    std::io::stdout().is_terminal()
+                }
+            }
+    })
 }
 
 fn paint(text: &str, code: &str) -> String {

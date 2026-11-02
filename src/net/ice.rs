@@ -19,6 +19,14 @@ pub fn interface_allowed(name: &str) -> bool {
 /// 枚举不到（权限、平台差异）就退回通配地址，宁可多收候选也别连不上。
 pub fn udp_bind_addrs() -> Vec<SocketAddr> {
     let wildcard = || vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)];
+    #[cfg(not(unix))]
+    {
+        // Windows / 其他平台没有 getifaddrs：直接绑通配地址，让 webrtc 自己枚举。
+        // 代价是可能收到 overlay 网卡的候选，但不至于连不上。
+        return wildcard();
+    }
+    #[cfg(unix)]
+    {
     let mut addrs = Vec::new();
     // SAFETY: getifaddrs 分配的链表由 freeifaddrs 释放；循环里只读，指针在释放前有效。
     unsafe {
@@ -63,6 +71,7 @@ pub fn udp_bind_addrs() -> Vec<SocketAddr> {
         wildcard()
     } else {
         addrs
+    }
     }
 }
 
